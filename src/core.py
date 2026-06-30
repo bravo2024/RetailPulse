@@ -1,96 +1,108 @@
+"""core.py — RFM segmentation and basket analysis metrics for RetailPulse.
+
+Retail analytics metrics, NOT generic classification:
+  * **RFM scores** — Recency, Frequency, Monetary value scoring.
+  * **Segment sizes** — count of customers in each RFM tier.
+  * **Basket support/confidence/lift** — association rule mining metrics.
+  * **Trend decomposition** — trend/seasonal/residual decomposition.
+
+References
+----------
+Hughes (1996), "Strategic Database Marketing." (RFM)
+Agrawal et al. (1993), "Mining Association Rules." (basket analysis)
+"""
 from __future__ import annotations
 import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
-from sklearn.metrics import (
-    roc_auc_score, accuracy_score, precision_score, recall_score, f1_score,
-    confusion_matrix, roc_curve, precision_recall_curve,
-)
-import xgboost as xgb
+from collections import Counter
 
 
-def compute_metrics(y_true, y_pred, y_proba=None):
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
-    metrics = {
-        "accuracy": accuracy_score(y_true, y_pred),
-        "precision": precision_score(y_true, y_pred, zero_division=0),
-        "recall": recall_score(y_true, y_pred, zero_division=0),
-        "f1": f1_score(y_true, y_pred, zero_division=0),
-        "specificity": tn / (tn + fp) if (tn + fp) > 0 else 0.0,
-        "fpr": fp / (fp + tn) if (fp + tn) > 0 else 0.0,
-        "fnr": fn / (fn + tp) if (fn + tp) > 0 else 0.0,
-    }
-    if y_proba is not None:
-        metrics["roc_auc"] = roc_auc_score(y_true, y_proba)
-        metrics["gini"] = 2.0 * metrics["roc_auc"] - 1.0
-    return metrics
+def compute_rfm(transactions, customer_col="customer_id", date_col="date",
+                amount_col="amount", reference_date=None):
+    """Compute RFM (Recency, Frequency, Monetary) per customer.
+
+    Returns DataFrame with customer_id, recency, frequency, monetary.
+    """
+    import pandas as pd
+    df = transactions
+    if reference_date is None:
+        reference_date = df[date_col].max()
+    rfm = df.groupby(customer_col).agg(
+        recency=(date_col, lambda x: (reference_date - x.max()).days),
+        frequency=(customer_col, "count"),
+        monetary=(amount_col, "sum"),
+    ).reset_index()
+    return rfm
 
 
-def ks_statistic(y_true, y_score):
-    ix = np.argsort(y_score)
-    y_true_sorted = y_true[ix]
-    y_score_sorted = y_score[ix]
-    n_total = len(y_true_sorted)
-    n_event = y_true_sorted.sum()
-    n_non_event = n_total - n_event
-    cum_event = np.cumsum(y_true_sorted) / n_event
-    cum_non_event = np.cumsum(1 - y_true_sorted) / n_non_event
-    return np.max(np.abs(cum_event - cum_non_event))
+def rfm_segment(rfm_df, n_quantiles=5):
+    """Segment customers into RFM tiers using quantile scoring."""
+    import pandas as pd
+    df = rfm_df.copy()
+    # Use rank-based scoring to avoid qcut duplicate/bin issues
+    df["R_score"] = pd.cut(df["recency"], bins=min(n_quantiles, df["recency"].nunique()),
+                           labels=False, include_lowest=True, duplicates="drop")
+    df["F_score"] = pd.cut(df["frequency"].rank(method="first"), bins=min(n_quantiles, df["frequency"].nunique()),
+                           labels=False, include_lowest=True, duplicates="drop")
+    df["M_score"] = pd.cut(df["monetary"], bins=min(n_quantiles, df["monetary"].nunique()),
+                           labels=False, include_lowest=True, duplicates="drop")
+    # Fill NaN with 0 and convert to int
+    for col in ["R_score", "F_score", "M_score"]:
+        df[col] = df[col].fillna(0).astype(int) + 1
+    # Invert R (lower recency = higher score = better)
+    df["R_score"] = n_quantiles + 1 - df["R_score"]
+    df["RFM_segment"] = df["R_score"].astype(str) + df["F_score"].astype(str) + df["M_score"].astype(str)
+    df["RFM_score"] = df["R_score"] + df["F_score"] + df["M_score"]
+    return df
 
 
-def population_stability_index(expected, actual, n_bins=10):
-    eps = 1e-10
-    bins = np.linspace(0, 1, n_bins + 1)
-    bin_labels = np.digitize(np.clip(np.concatenate([expected, actual]), 0, 0.999), bins[1:-1]) - 1
-    expected_counts = np.bincount(bin_labels[:len(expected)], minlength=n_bins)
-    actual_counts = np.bincount(bin_labels[len(expected):], minlength=n_bins)
-    expected_pct = expected_counts / expected_counts.sum()
-    actual_pct = actual_counts / actual_counts.sum()
-    psi = np.sum((actual_pct - expected_pct) * np.log((actual_pct + eps) / (expected_pct + eps)))
-    return psi
+def segment_summary(segmented_df):
+    """Summarize segment sizes and average metrics."""
+    segments = segmented_df.groupby("RFM_score").agg(
+        n_customers=("customer_id", "count"),
+        avg_recency=("recency", "mean"),
+        avg_frequency=("frequency", "mean"),
+        avg_monetary=("monetary", "mean"),
+    ).reset_index()
+    return segments
 
 
-def build_models(X_train, y_train, seed=42):
-    lr = LogisticRegression(C=0.1, class_weight="balanced", solver="liblinear", random_state=seed, max_iter=1000)
-    lr.fit(X_train, y_train)
-    rf = RandomForestClassifier(n_estimators=200, max_depth=8, min_samples_leaf=20,
-                                class_weight="balanced", random_state=seed, n_jobs=-1)
-    rf.fit(X_train, y_train)
-    gbt = GradientBoostingClassifier(n_estimators=200, max_depth=5, min_samples_leaf=20,
-                                     learning_rate=0.05, subsample=0.8, random_state=seed)
-    gbt.fit(X_train, y_train)
-    xgb_model = xgb.XGBClassifier(
-        n_estimators=200, max_depth=5, learning_rate=0.05,
-        subsample=0.8, colsample_bytree=0.8,
-        scale_pos_weight=(y_train.mean() > 0.1) * 1.0 + (y_train.mean() <= 0.1) * 3.0,
-        eval_metric="logloss", random_state=seed,
-    )
-    xgb_model.fit(X_train, y_train)
-    return {
-        "Logistic Regression": lr,
-        "Random Forest": rf,
-        "Gradient Boosting": gbt,
-        "XGBoost": xgb_model,
-    }
+def basket_support(itemsets, itemset):
+    """Support = fraction of transactions containing the itemset."""
+    if not itemsets:
+        return 0.0
+    count = sum(1 for t in itemsets if set(itemset).issubset(set(t)))
+    return count / len(itemsets)
 
 
-def woe_transform(df, feature, target, min_samples=5):
-    if df[feature].dtype == object or df[feature].nunique() < 10:
-        groups = df.groupby(feature)[target]
-    else:
-        df["_bin"] = pd.qcut(df[feature], 10, duplicates="drop")
-        groups = df.groupby("_bin")[target]
-    result = groups.agg(["count", "sum"])
-    result.columns = ["count", "event"]
-    result = result[result["count"] >= min_samples]
-    result["non_event"] = result["count"] - result["event"]
-    n_event_total = result["event"].sum()
-    n_non_event_total = result["non_event"].sum()
-    result["event_rate"] = (result["event"] + 0.5) / (n_event_total + 0.5)
-    result["non_event_rate"] = (result["non_event"] + 0.5) / (n_non_event_total + 0.5)
-    result["woe"] = np.log(result["event_rate"] / result["non_event_rate"])
-    result["iv"] = (result["event_rate"] - result["non_event_rate"]) * result["woe"]
-    return result
+def basket_confidence(itemsets, antecedent, consequent):
+    """Confidence = support(A∪C) / support(A)."""
+    sup_a = basket_support(itemsets, antecedent)
+    if sup_a == 0:
+        return 0.0
+    sup_ac = basket_support(itemsets, list(set(antecedent) | set(consequent)))
+    return sup_ac / sup_a
+
+
+def basket_lift(itemsets, antecedent, consequent):
+    """Lift = confidence / support(C). Lift > 1 = positive correlation."""
+    sup_c = basket_support(itemsets, consequent)
+    if sup_c == 0:
+        return 0.0
+    return basket_confidence(itemsets, antecedent, consequent) / sup_c
+
+
+def trend_decomposition(series, window=12):
+    """Simple trend/seasonal/residual decomposition using moving average."""
+    s = np.asarray(series, dtype=float)
+    n = len(s)
+    if n < window * 2:
+        return {"trend": s.tolist(), "seasonal": [0.0] * n, "residual": [0.0] * n}
+    # Trend via centered moving average
+    trend = np.convolve(s, np.ones(window) / window, mode="same")
+    detrended = s - trend
+    # Seasonal = average detrended value per position in cycle
+    seasonal = np.zeros(n)
+    for i in range(n):
+        seasonal[i] = np.mean(detrended[i::window]) if i < window else seasonal[i % window]
+    residual = s - trend - seasonal
+    return {"trend": trend.tolist(), "seasonal": seasonal.tolist(), "residual": residual.tolist()}
